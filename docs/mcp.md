@@ -214,25 +214,66 @@ Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to expose the state-changing tools, and
 ### MCP Inspector
 
 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is a
-browser-based client for trying tools by hand. It needs Node.js. Start it from
-the repository root and let it launch the server; pass the key with `-e` so it
-reaches the server process:
+browser-based client for trying tools by hand. It needs Node.js. The
+instructions below pin **Inspector 1.0.3** (the v1 interface). Inspector 2.x
+is a different application: its launcher has no `-e` flag, it starts a stdio
+server with only a fixed safe subset of variables plus the `env` of a
+configured server entry (the shell's own variables are not inherited), and
+servers are managed through a config or catalog file. Pinning the version
+keeps the interface stable and keeps the environment rules below valid.
+Unpinned `npx @modelcontextprotocol/inspector` installs 2.x.
 
-```bash
-npx @modelcontextprotocol/inspector -e GEMINI_API_KEY=<your key> \
-  -- /path/to/CamAgent/.venv/bin/python -m app.mcp_server
+How 1.0.3 passes the environment to the server, from its source: the proxy
+spawns the server with the MCP SDK's safe subset (`PATH`, `SYSTEMROOT`,
+`APPDATA`, `TEMP`, ... on Windows), then the Inspector's own process
+environment, then whatever the UI's **Environment Variables** panel
+contains. `-e NAME=value` pre-fills that panel. Consequences:
+
+- A variable set in the Command Prompt window that runs `npx` reaches the
+  server, and so does a variable passed with `-e`.
+- A `GEMINI_API_KEY` row with an empty value in the panel overrides the shell
+  and makes CamAgent report `GEMINI_API_KEY is not set`. Fill it in or
+  remove the row, then press **Connect** (or **Restart**) again.
+- Variables set in the shell after the Inspector started are not seen until
+  the Inspector is restarted. Panel changes apply on the next connect, since
+  every connect starts a new server process.
+- The proxy's console prints the panel's variable names, never values, as
+  `env: [names: ...]`, which shows what was sent.
+
+Windows Command Prompt, from the repository root:
+
+```bat
+cd /d C:\path\to\CamAgent
+set GEMINI_API_KEY=<your key>
+set CAMAGENT_MODEL=gemini-3.8-flash
+npx -y @modelcontextprotocol/inspector@1.0.3 -e GEMINI_API_KEY=%GEMINI_API_KEY% -e CAMAGENT_MODEL=%CAMAGENT_MODEL% -- py -3.13 -m app.mcp_server
 ```
 
-On Windows PowerShell, with the virtual environment's interpreter:
+`set` takes no quotes and no spaces around `=`. `%GEMINI_API_KEY%` expands
+only in the window where `set` ran; `setx` and the System Properties dialog
+affect only windows opened afterwards. When the variable is not set, Command
+Prompt passes the literal text `%GEMINI_API_KEY%` and Gemini rejects it with
+an authentication error. For a screen recording, keep the key off the
+command line: run `set GEMINI_API_KEY=...` before recording, then `cls`, and
+launch without `-e GEMINI_API_KEY=...`; the proxy still inherits it from the
+window.
 
-```powershell
-npx @modelcontextprotocol/inspector -e GEMINI_API_KEY=<your key> -- .venv\Scripts\python.exe -m app.mcp_server
+Linux and macOS, with the virtual environment active:
+
+```bash
+cd /path/to/CamAgent
+export GEMINI_API_KEY="<your key>"
+npx -y @modelcontextprotocol/inspector@1.0.3 -e GEMINI_API_KEY="$GEMINI_API_KEY" -e CAMAGENT_MODEL=gemini-3.8-flash -- python -m app.mcp_server
 ```
 
 Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to see the state-changing tools too.
-Then, in the browser page the command opens:
+Then, in the browser page the command opens (its URL carries the session
+token printed in the console):
 
-1. Keep **Transport Type** at `STDIO` and press **Connect**.
+1. Keep **Transport Type** at `STDIO`. **Command** shows `py` and
+   **Arguments** `-3.13 -m app.mcp_server`. Open **Environment Variables**
+   and check that `GEMINI_API_KEY` is listed with a value. Press
+   **Connect**.
 2. Open the **Tools** tab and press **List Tools**. The four read-only tools
    appear (seven with mutations enabled).
 3. Select `parse_request`, type a request such as
@@ -243,8 +284,23 @@ Expected result: the response envelope with `"status": "parsed"`,
 `"action": {"operation": "check_module", "module": "uvcvideo"}`, and
 `"result": {"executed": false}`. Nothing is executed; to act on it, call
 `check_module` with `{"module": "uvcvideo"}`. A request Gemini cannot map
-returns `ambiguous` or `unsupported` with `"action": null`, and without a
-key the status is `provider_error` with `GEMINI_API_KEY` named in `errors`.
+returns `ambiguous` or `unsupported` with `"action": null`.
+
+`provider_error` entries you may see in `errors`:
+
+| `errors` entry | Meaning |
+| --- | --- |
+| `GEMINI_API_KEY is not set ...` | The server process has no key: the variable was not in the window that launched the Inspector, the Inspector is 2.x, or the panel holds an empty `GEMINI_API_KEY` row. |
+| `Gemini API authentication failed (HTTP 400 or 403) ...` | A key reached Gemini and was rejected: a typo, the literal `%GEMINI_API_KEY%`, or a revoked key. The key value is never included. |
+| `Gemini API is unavailable (HTTP 503) ...` | Gemini's side: the model is temporarily overloaded. Not an application error. Retry, or set `CAMAGENT_MODEL` to another current model. |
+| `Gemini API rate limit or quota exceeded (HTTP 429) ...` | The key's quota is exhausted for now. Wait, or use another model. |
+
+The same check from the command line, without the browser, uses the
+Inspector's CLI mode (flags before the command, no `--`):
+
+```bat
+npx -y @modelcontextprotocol/inspector@1.0.3 --cli -e GEMINI_API_KEY=%GEMINI_API_KEY% py -3.13 -m app.mcp_server --method tools/call --tool-name parse_request --tool-arg "request=is the webcam driver loaded?"
+```
 
 ### Testing with the MCP Python client
 

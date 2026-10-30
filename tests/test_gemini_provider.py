@@ -23,7 +23,7 @@ import pytest
 from app.agent import ActionExecutor
 from app.llm import GeminiProvider, IntentParser, LLMProviderError
 from app.llm.intent import RESPONSE_SCHEMA, SYSTEM_PROMPT
-from app.llm.provider import API_KEY_ENV_VAR, DEFAULT_MODEL, MODEL_ENV_VAR
+from app.llm.provider import API_KEY_ENV_VAR, DEFAULT_MODEL, FALLBACK_API_KEY_ENV_VAR, MODEL_ENV_VAR
 from app.manager import module_manager
 from app.mcp_server import TOOL_SPECS, ToolDispatcher
 from app.safety import DEFAULT_PROTECTED_MODULES, SafetyPolicy, validate_raw
@@ -157,6 +157,7 @@ class FakeModuleManager:
 def isolated_environment(monkeypatch):
     """No real key, no real model override, and no system commands."""
     monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv(FALLBACK_API_KEY_ENV_VAR, raising=False)
     monkeypatch.delenv(MODEL_ENV_VAR, raising=False)
 
     def explode(*args, **kwargs):  # pragma: no cover - only runs on a regression
@@ -606,6 +607,52 @@ def test_api_key_is_read_from_env_and_never_echoed(monkeypatch):
     assert secret not in result.errors[0]
     assert "***" in result.errors[0]
     assert secret not in json.dumps(result.to_dict())
+
+
+@pytest.mark.parametrize(
+    ("gemini_value", "google_value", "expected"),
+    [
+        ("gemini-key", None, "gemini-key"),
+        (None, "google-key", "google-key"),
+        ("gemini-key", "google-key", "gemini-key"),
+        ("  gemini-key \n", None, "gemini-key"),
+        ("   ", "google-key", "google-key"),
+    ],
+)
+def test_key_lookup_prefers_gemini_then_google_variable(monkeypatch, gemini_value, google_value, expected):
+    genai = pytest.importorskip("google.genai")
+    if gemini_value is not None:
+        monkeypatch.setenv(API_KEY_ENV_VAR, gemini_value)
+    if google_value is not None:
+        monkeypatch.setenv(FALLBACK_API_KEY_ENV_VAR, google_value)
+    created: dict[str, Any] = {}
+
+    class FakeSDKClient(FakeGeminiClient):
+        def __init__(self, *, api_key: str) -> None:
+            created["api_key"] = api_key
+            super().__init__([reply("list_modules")])
+
+    monkeypatch.setattr(genai, "Client", FakeSDKClient)
+
+    assert IntentParser(GeminiProvider()).parse("list modules").ok
+    assert created["api_key"] == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_blank_key_counts_as_missing(monkeypatch, value):
+    genai = pytest.importorskip("google.genai")
+    monkeypatch.setenv(API_KEY_ENV_VAR, value)
+
+    def no_client(*args, **kwargs):  # pragma: no cover - only runs on a regression
+        raise AssertionError("the SDK client must not be created without a key")
+
+    monkeypatch.setattr(genai, "Client", no_client)
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert result.errors[0].startswith(f"{API_KEY_ENV_VAR} is not set")
+    assert "-e GEMINI_API_KEY=" in result.errors[0]
 
 
 def test_client_is_created_once_and_reused(monkeypatch):

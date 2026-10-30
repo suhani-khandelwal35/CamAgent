@@ -336,12 +336,17 @@ Related settings:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GEMINI_API_KEY` | none | Google AI Studio API key for `parse_request`. Only needed when `parse_request` is used. |
-| `CAMAGENT_MODEL` | `gemini-3.8-flash` | Gemini model used by `parse_request`. Any current Gemini API model that supports JSON structured output can be set here. |
+| `GOOGLE_API_KEY` | none | Fallback for `GEMINI_API_KEY`, the other name the `google-genai` SDK accepts. Ignored when `GEMINI_API_KEY` is set. |
+| `CAMAGENT_MODEL` | `gemini-3.8-flash` | Gemini model used by `parse_request`, read when the first request is parsed. Any current Gemini API model that supports JSON structured output can be set here. |
 
 When the key is missing, `parse_request` returns status `provider_error`
-with the error `GEMINI_API_KEY is not set; create a key in Google AI Studio
-and set it in the environment of the process running CamAgent`, and every
-other tool keeps working. An invalid key, an exhausted quota, or a network
+with an error starting `GEMINI_API_KEY is not set in the environment of the
+process running CamAgent`, and every other tool keeps working. "The process
+running CamAgent" is the server subprocess that the MCP client starts, so
+the variable must reach that process: through the client's `env` block, or
+for MCP Inspector through `-e` or its Environment Variables panel (see
+[docs/mcp.md](docs/mcp.md#mcp-inspector), which also explains why the pinned
+Inspector 1.0.3 is used). An invalid key, an exhausted quota, or a network
 failure is also reported as `provider_error`, with the HTTP status in the
 `errors` field. When the `google-genai` package is not installed, the error
 text is `the 'google-genai' package is required for GeminiProvider; install
@@ -468,6 +473,7 @@ for validation details and limitations.
 | `VALIDATION REJECTED:` with a module-name error | The name contains characters CamAgent refuses | Use the module's plain name, for example `uvcvideo`, not a path or `.ko` file. |
 | MCP response `tool_disabled` | State-changing tools are hidden | Start the server with `CAMAGENT_MCP_ALLOW_MUTATIONS=1`. |
 | MCP response `provider_error` from `parse_request` | `GEMINI_API_KEY` is not set or invalid, the Gemini quota is exhausted, the network is down, or the `google-genai` package is missing | Read the `errors` field: it names the missing variable, the HTTP status, or the missing package. Set `GEMINI_API_KEY` in the server's environment (see [Gemini API key](#gemini-api-key)) and install `google-genai`. The other tools are unaffected. |
+| `provider_error` with `Gemini API is unavailable (HTTP 503)` | Gemini reported the model as temporarily overloaded | A transient condition on Google's side, not a CamAgent error. Retry later, or point `CAMAGENT_MODEL` at another current model. |
 
 ## Current limitations
 

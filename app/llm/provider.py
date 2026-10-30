@@ -20,6 +20,9 @@ from typing import Any, Mapping, Protocol
 DEFAULT_MODEL = "gemini-3.8-flash"
 MODEL_ENV_VAR = "CAMAGENT_MODEL"
 API_KEY_ENV_VAR = "GEMINI_API_KEY"
+# The google-genai SDK itself also reads GOOGLE_API_KEY; accept it as a
+# fallback so a key set under that name is not reported as "not set".
+FALLBACK_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 
 # Finish reasons that mean Gemini refused or filtered the reply. Anything
 # other than a normal stop is treated as a failure: the parser must reject
@@ -53,6 +56,15 @@ def _enum_name(value: Any) -> str:
     if isinstance(name, str):
         return name.upper()
     return str(value).upper()
+
+
+def _api_key_from_env() -> str:
+    """The configured API key, or an empty string. Never logged."""
+    for name in (API_KEY_ENV_VAR, FALLBACK_API_KEY_ENV_VAR):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _redact(text: str, secret: str | None) -> str:
@@ -151,11 +163,13 @@ class GeminiProvider:
                     "the 'google-genai' package is required for GeminiProvider; "
                     "install it with 'pip install google-genai'"
                 ) from exc
-            api_key = os.environ.get(API_KEY_ENV_VAR, "").strip()
+            api_key = _api_key_from_env()
             if not api_key:
                 raise LLMProviderError(
-                    f"{API_KEY_ENV_VAR} is not set; create a key in Google AI Studio "
-                    "and set it in the environment of the process running CamAgent"
+                    f"{API_KEY_ENV_VAR} is not set in the environment of the process "
+                    "running CamAgent (an MCP client must pass it in its env block, "
+                    f"or MCP Inspector with -e {API_KEY_ENV_VAR}=...); create a key "
+                    "in Google AI Studio"
                 )
             try:
                 self._client = genai.Client(api_key=api_key)
@@ -182,7 +196,7 @@ class GeminiProvider:
             config["response_mime_type"] = "application/json"
             config["response_json_schema"] = dict(response_schema)
 
-        secret = os.environ.get(API_KEY_ENV_VAR)
+        secret = _api_key_from_env()
         try:
             response = client.models.generate_content(
                 model=self.model,
