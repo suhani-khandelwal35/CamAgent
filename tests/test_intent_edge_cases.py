@@ -1,6 +1,6 @@
 """Edge-case tests for the natural-language intent parser (app/llm/intent.py).
 
-Every test uses a fake LLM provider: no network, no Anthropic API key and no
+Every test uses a fake LLM provider: no network, no Gemini API key and no
 Linux module operations. The tests pin down the parser's documented contract:
 reject rather than guess, never retry, never execute.
 """

@@ -14,7 +14,7 @@ reach a shell.
 | `app/mcp_server/tools.py` | Tool catalog, strict argument validation, routing to the executor or intent parser, and the response envelope. Has no MCP dependency. |
 | `app/agent/executor.py` | Runs schema validation, the safety policy, dry-run, and confirmation before calling the module manager. |
 | `app/llm/intent.py` | Turns a natural-language request into one structured action, or rejects it. Never executes anything. |
-| `app/llm/provider.py` | LLM provider interface and the Anthropic implementation. |
+| `app/llm/provider.py` | LLM provider interface and the Google Gemini implementation (`google-genai` SDK). |
 
 Request flow for a module tool:
 
@@ -115,8 +115,9 @@ Status codes:
 
 ## Natural-language parsing
 
-`parse_request` sends the request text to an LLM with a fixed system prompt,
-and requires a JSON reply in this form:
+`parse_request` sends the request text to Gemini with a fixed system prompt
+and a JSON response schema (constrained decoding), and requires a JSON reply
+in this form:
 
 ```json
 {"status": "action", "action": {"operation": "check_module", "module": "uvcvideo"}, "reason": "..."}
@@ -132,18 +133,23 @@ named in the request. The only exception is the documented device aliases in
 
 `parse_request` never executes the action it returns. A client that wants to
 act on it calls the matching tool, so the normal validation, policy, and
-confirmation rules apply.
+confirmation rules apply. Gemini is given no tools and no function-calling
+configuration, so it cannot request a shell command; the schema only allows
+the six operations and a module name, and a reply outside that shape is
+rejected with `invalid_output`.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CAMAGENT_MCP_ALLOW_MUTATIONS` | unset (disabled) | Set to `1`, `true`, `yes`, or `on` to expose `load_module`, `unload_module`, and `reload_module`. |
-| `ANTHROPIC_API_KEY` | none | Credentials for `parse_request`. The Anthropic SDK also accepts `ANTHROPIC_AUTH_TOKEN` or an `ant auth login` profile. Only needed when `parse_request` is used. |
-| `CAMAGENT_MODEL` | `claude-opus-5-5` | Model used by `parse_request`. |
+| `GEMINI_API_KEY` | none | Google AI Studio API key for `parse_request`. Only needed when `parse_request` is used. See the README section [Gemini API key](../README.md#gemini-api-key) for how to obtain one and set it on Windows and Linux. |
+| `CAMAGENT_MODEL` | `gemini-3.8-flash` | Gemini model used by `parse_request`. |
 
-The server starts without LLM credentials. If none are available,
-`parse_request` returns `provider_error` and the other tools work as usual.
+The server starts without an API key. If none is available, `parse_request`
+returns `provider_error` (the `errors` entry names `GEMINI_API_KEY`) and the
+other tools work as usual. The key is read from the environment only and is
+never written to logs or error messages.
 
 ## Running the server
 
@@ -186,7 +192,7 @@ claude mcp add camagent \
 ```
 
 Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to expose the state-changing tools, and
-`-e ANTHROPIC_API_KEY=...` to enable `parse_request`.
+`-e GEMINI_API_KEY=...` to enable `parse_request`.
 
 ### Claude Desktop and other JSON-configured clients
 
@@ -205,6 +211,41 @@ Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to expose the state-changing tools, and
 }
 ```
 
+### MCP Inspector
+
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) is a
+browser-based client for trying tools by hand. It needs Node.js. Start it from
+the repository root and let it launch the server; pass the key with `-e` so it
+reaches the server process:
+
+```bash
+npx @modelcontextprotocol/inspector -e GEMINI_API_KEY=<your key> \
+  -- /path/to/CamAgent/.venv/bin/python -m app.mcp_server
+```
+
+On Windows PowerShell, with the virtual environment's interpreter:
+
+```powershell
+npx @modelcontextprotocol/inspector -e GEMINI_API_KEY=<your key> -- .venv\Scripts\python.exe -m app.mcp_server
+```
+
+Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to see the state-changing tools too.
+Then, in the browser page the command opens:
+
+1. Keep **Transport Type** at `STDIO` and press **Connect**.
+2. Open the **Tools** tab and press **List Tools**. The four read-only tools
+   appear (seven with mutations enabled).
+3. Select `parse_request`, type a request such as
+   `is the webcam driver loaded?` in the `request` field, and press
+   **Run Tool**.
+
+Expected result: the response envelope with `"status": "parsed"`,
+`"action": {"operation": "check_module", "module": "uvcvideo"}`, and
+`"result": {"executed": false}`. Nothing is executed; to act on it, call
+`check_module` with `{"module": "uvcvideo"}`. A request Gemini cannot map
+returns `ambiguous` or `unsupported` with `"action": null`, and without a
+key the status is `provider_error` with `GEMINI_API_KEY` named in `errors`.
+
 ### Testing with the MCP Python client
 
 Run this from the repository root with the virtual environment's Python:
@@ -218,7 +259,7 @@ from mcp import Client, StdioServerParameters
 
 async def main():
     # The MCP client starts the server with a minimal environment unless `env`
-    # is given; pass it so CAMAGENT_MCP_ALLOW_MUTATIONS and ANTHROPIC_API_KEY
+    # is given; pass it so CAMAGENT_MCP_ALLOW_MUTATIONS and GEMINI_API_KEY
     # exported in your shell reach the server process.
     params = StdioServerParameters(
         command=sys.executable, args=["-m", "app.mcp_server"], env=dict(os.environ)
@@ -243,7 +284,7 @@ anyio.run(main)
 | `rejected` | The safety policy refused the action (protected module, already loaded, not loaded) | Check the `errors` field; these actions are not retried. |
 | `error` with `FileNotFoundError` in `errors` | `lsmod`, `modinfo`, or `modprobe` is not installed, or the host is not Linux | Install the `kmod` utilities on a Linux host. |
 | `permission_error` | A utility reported insufficient permissions | Run the server with the privileges the operation needs; it never elevates itself. |
-| `provider_error` from `parse_request` | No Anthropic credentials, or the `anthropic` package is missing | Set `ANTHROPIC_API_KEY` for the server process and install `anthropic`. Other tools are unaffected. |
+| `provider_error` from `parse_request` | `GEMINI_API_KEY` is not set or invalid, the Gemini quota is exhausted, the network is down, or the `google-genai` package is missing | Read the `errors` field. Set `GEMINI_API_KEY` for the server process (with `-e` or the `env` block) and install `google-genai`. Other tools are unaffected. |
 | `internal_error` | An unexpected failure | Details are written to the server's stderr log, not returned to the client. |
 
 ## Integration status
@@ -254,8 +295,9 @@ Working:
   tools listed above.
 - Strict argument validation, safety policy, dry-run, and confirmation gating
   for every tool call.
-- Natural-language parsing via `parse_request` with the Anthropic provider,
-  plus an `LLMProvider` interface for alternative or mocked providers.
+- Natural-language parsing via `parse_request` with the Google Gemini
+  provider (`google-genai` SDK, `GEMINI_API_KEY`), plus an `LLMProvider`
+  interface for alternative or mocked providers.
 - `lsmod` failures reported as errors rather than as "module not loaded".
 - CLI and MCP actions routed through the same `ActionExecutor` validation,
   state policy, confirmation, dispatch, and post-operation verification path.

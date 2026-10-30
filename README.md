@@ -11,7 +11,7 @@ Contents:
 - [Running the CLI](#running-the-cli)
 - [Expected output](#expected-output)
 - [Safety behaviour](#safety-behaviour)
-- [Anthropic API key](#anthropic-api-key)
+- [Gemini API key](#gemini-api-key)
 - [MCP server](#mcp-server)
 - [Tests](#tests)
 - [Troubleshooting](#troubleshooting)
@@ -28,8 +28,8 @@ see [docs/release-checklist.md](docs/release-checklist.md).
   command that touches kernel modules.
 - Appropriate system permissions for module changes (typically root). CamAgent
   never elevates privileges itself.
-- Optional: the `mcp` package to run the MCP server, and the `anthropic`
-  package plus Anthropic credentials to use the `parse_request` MCP tool. Both
+- Optional: the `mcp` package to run the MCP server, and the `google-genai`
+  package plus a Gemini API key to use the `parse_request` MCP tool. Both
   are listed in `requirements.txt`; the CLI works without them.
 
 The CLI and tests start on other platforms, but every module command needs the
@@ -49,7 +49,7 @@ python -m pip install -r requirements.txt
 On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1` instead of
 `source .venv/bin/activate`.
 
-`requirements.txt` installs `pytest`, `anthropic`, and `mcp`. There is no
+`requirements.txt` installs `pytest`, `google-genai`, and `mcp`. There is no
 package to install for CamAgent itself: run it from the project directory with
 `python -m ...` so that the `app` package is importable.
 
@@ -270,34 +270,83 @@ The CLI and the MCP server share one execution path
    consulted again. A successful command whose observed state does not match
    the request is reported as a failure, never as success.
 
-## Anthropic API key
+## Gemini API key
 
-Only the MCP `parse_request` tool talks to an LLM. The CLI, the other MCP
-tools, and the test suite never contact the Anthropic API, and the MCP server
-starts without credentials.
+Only the MCP `parse_request` tool talks to an LLM, through Google's Gemini API
+and the official `google-genai` SDK. The CLI, the other MCP tools, and the test
+suite never contact the Gemini API, and the MCP server starts without a key:
+the key is read the first time `parse_request` is called.
 
-Credentials are resolved by the Anthropic SDK, not by CamAgent. The usual way
-is an environment variable in the shell that launches the server, or in the
-MCP client's `env` block:
+Gemini only interprets the request and returns a structured action. Every
+action it proposes goes through the same schema validation, module-name
+validation, safety policy, and confirmation gate as any other input, in
+deterministic Python code. Gemini is never asked for, and cannot trigger,
+shell commands.
 
-```bash
-export ANTHROPIC_API_KEY="<your key>"
+### Getting a key from Google AI Studio
+
+1. Sign in at [Google AI Studio](https://aistudio.google.com/) with a Google
+   account.
+2. Open the [API keys page](https://aistudio.google.com/apikey) and choose
+   **Create API key**. Select or create a Google Cloud project if asked.
+3. Copy the key. You can create another one at any time, and you should
+   delete a key as soon as it may have leaked.
+
+### Configuring `GEMINI_API_KEY`
+
+CamAgent reads the key from the `GEMINI_API_KEY` environment variable of the
+process that runs the MCP server. Set it in the shell that launches the
+server, or in the MCP client's `env` block (see [MCP server](#mcp-server)).
+
+Windows PowerShell, for the current window only:
+
+```powershell
+$env:GEMINI_API_KEY = "<your key>"
+python -m app.mcp_server
 ```
 
-The SDK also accepts `ANTHROPIC_AUTH_TOKEN` or a profile created with
-`ant auth login`. Never commit a key to the repository or paste one into
-documentation or MCP client configuration that is shared.
+Windows, stored for your user account (takes effect in new windows):
 
-Related setting:
+```powershell
+[Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "<your key>", "User")
+```
+
+Windows Command Prompt: `set GEMINI_API_KEY=<your key>` for the current
+window, or `setx GEMINI_API_KEY "<your key>"` to store it.
+
+Linux (and macOS), for the current shell only:
+
+```bash
+export GEMINI_API_KEY="<your key>"
+python -m app.mcp_server
+```
+
+To keep it across shells, add the `export` line to `~/.bashrc`, `~/.zshrc`,
+or `~/.profile`, or to a systemd unit's `Environment=` if the server runs as a
+service.
+
+[.env.example](.env.example) lists every variable CamAgent reads. You can copy
+it to `.env` to keep your own values; `.env` is ignored by Git. CamAgent does
+not load `.env` by itself, so the variable still has to be set in the
+environment as shown above. Never commit a key to the repository or paste one
+into documentation or MCP client configuration that is shared.
+
+Related settings:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CAMAGENT_MODEL` | `claude-opus-5-5` | Model used by `parse_request`. |
+| `GEMINI_API_KEY` | none | Google AI Studio API key for `parse_request`. Only needed when `parse_request` is used. |
+| `CAMAGENT_MODEL` | `gemini-3.8-flash` | Gemini model used by `parse_request`. Any current Gemini API model that supports JSON structured output can be set here. |
 
-When no credentials are available, `parse_request` returns status
-`provider_error` and every other tool keeps working. When the `anthropic`
-package is not installed, the error text is
-`the 'anthropic' package is required for AnthropicProvider; install it with 'pip install anthropic'`.
+When the key is missing, `parse_request` returns status `provider_error`
+with the error `GEMINI_API_KEY is not set; create a key in Google AI Studio
+and set it in the environment of the process running CamAgent`, and every
+other tool keeps working. An invalid key, an exhausted quota, or a network
+failure is also reported as `provider_error`, with the HTTP status in the
+`errors` field. When the `google-genai` package is not installed, the error
+text is `the 'google-genai' package is required for GeminiProvider; install
+it with 'pip install google-genai'`. The key itself never appears in any
+error message.
 
 ## MCP server
 
@@ -316,7 +365,7 @@ Tools:
 | `list_modules` | No | Yes | |
 | `get_module_info` | No | Yes | `module` |
 | `check_module` | No | Yes | `module` |
-| `parse_request` | No | Yes | `request`, Anthropic credentials |
+| `parse_request` | No | Yes | `request`, `GEMINI_API_KEY` |
 | `load_module` | Yes | Only with `CAMAGENT_MCP_ALLOW_MUTATIONS` | `module`, `confirm: true` (or `dry_run: true`) |
 | `unload_module` | Yes | Only with `CAMAGENT_MCP_ALLOW_MUTATIONS` | `module`, `confirm: true` (or `dry_run: true`) |
 | `reload_module` | Yes | Only with `CAMAGENT_MCP_ALLOW_MUTATIONS` | `module`, `confirm: true` (or `dry_run: true`) |
@@ -341,11 +390,11 @@ claude mcp add camagent \
 ```
 
 Add `-e CAMAGENT_MCP_ALLOW_MUTATIONS=1` to expose the state-changing tools and
-`-e ANTHROPIC_API_KEY=...` to enable `parse_request`.
+`-e GEMINI_API_KEY=...` to enable `parse_request`.
 
 [docs/mcp.md](docs/mcp.md) documents every tool's inputs, the response
-envelope and status codes, the JSON configuration for Claude Desktop, and a
-Python client example.
+envelope and status codes, the JSON configuration for Claude Desktop, how to
+try `parse_request` in MCP Inspector, and a Python client example.
 
 ## Tests
 
@@ -355,8 +404,9 @@ Run the unit tests with:
 python -m pytest
 ```
 
-Tests mock Linux command interactions and the LLM provider, and never load or
-unload real drivers or call the Anthropic API. The MCP protocol tests are
+Tests mock Linux command interactions and the Gemini client, and never load or
+unload real drivers or call the Gemini API; no `GEMINI_API_KEY` or network
+access is needed. The MCP protocol tests are
 skipped when the `mcp` package is not installed. The end-to-end tests in
 `tests/test_end_to_end_workflows.py` drive the real CLI, executor, module
 manager, and MCP dispatcher over a scripted stand-in for `lsmod`, `modinfo`,
@@ -417,7 +467,7 @@ for validation details and limitations.
 | `FAILURE: The requested module state could not be verified.` | `modprobe` exited successfully but `lsmod` does not show the requested state | Inspect `dmesg` and the module's dependencies; the result is reported as a failure on purpose. |
 | `VALIDATION REJECTED:` with a module-name error | The name contains characters CamAgent refuses | Use the module's plain name, for example `uvcvideo`, not a path or `.ko` file. |
 | MCP response `tool_disabled` | State-changing tools are hidden | Start the server with `CAMAGENT_MCP_ALLOW_MUTATIONS=1`. |
-| MCP response `provider_error` from `parse_request` | No Anthropic credentials, or the `anthropic` package is missing | Set `ANTHROPIC_API_KEY` in the server's environment and install `anthropic`. The other tools are unaffected. |
+| MCP response `provider_error` from `parse_request` | `GEMINI_API_KEY` is not set or invalid, the Gemini quota is exhausted, the network is down, or the `google-genai` package is missing | Read the `errors` field: it names the missing variable, the HTTP status, or the missing package. Set `GEMINI_API_KEY` in the server's environment (see [Gemini API key](#gemini-api-key)) and install `google-genai`. The other tools are unaffected. |
 
 ## Current limitations
 

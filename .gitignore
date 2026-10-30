@@ -10,3 +10,8 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Local secrets (GEMINI_API_KEY and friends). Only .env.example is tracked.
+.env
+.env.*
+!.env.example

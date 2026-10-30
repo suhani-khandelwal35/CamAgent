@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.agent import ActionExecutor, ExecutionResult
-from app.llm import AnthropicProvider, IntentParser, IntentResult
+from app.llm import GeminiProvider, IntentParser, IntentResult
 from app.llm.intent import MAX_REQUEST_LENGTH
 from app.manager import module_manager
 from app.safety import module_name_errors
@@ -240,7 +240,7 @@ class ToolDispatcher:
     def _parser(self) -> IntentParser:
         # Created on first use so the server starts without LLM credentials.
         if self._intent_parser is None:
-            self._intent_parser = IntentParser(AnthropicProvider())
+            self._intent_parser = IntentParser(GeminiProvider())
         elif not isinstance(self._intent_parser, IntentParser):
             self._intent_parser = self._intent_parser()
         return self._intent_parser

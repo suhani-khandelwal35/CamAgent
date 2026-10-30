@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.llm import AnthropicProvider, IntentParser, LLMProviderError, module_is_grounded
+from app.llm import GeminiProvider, IntentParser, LLMProviderError, module_is_grounded
 from app.llm.intent import MAX_REQUEST_LENGTH, RESPONSE_SCHEMA, SYSTEM_PROMPT
 from app.schemas import Operation
 
@@ -207,62 +207,74 @@ def test_module_grounding(request_text, module, expected):
     assert module_is_grounded(request_text, module) is expected
 
 
-def fake_anthropic_client(stop_reason="end_turn", content=None):
-    calls = []
-    response = SimpleNamespace(
-        stop_reason=stop_reason,
-        content=content if content is not None else [SimpleNamespace(type="text", text='{"ok": 1}')],
-    )
+# --------------------------------------------------------------------------- #
+# GeminiProvider over a fake google-genai client (no key, no network)
+# --------------------------------------------------------------------------- #
 
-    def create(**kwargs):
+
+def fake_gemini_client(finish_reason="STOP", parts=None, prompt_feedback=None):
+    """A stand-in for google.genai.Client that records generate_content calls."""
+    calls = []
+    if parts is None:
+        parts = [SimpleNamespace(text='{"ok": 1}', thought=None)]
+    candidate = SimpleNamespace(
+        finish_reason=SimpleNamespace(name=finish_reason),
+        content=SimpleNamespace(parts=parts),
+    )
+    response = SimpleNamespace(candidates=[candidate], prompt_feedback=prompt_feedback)
+
+    def generate_content(**kwargs):
         calls.append(kwargs)
         return response
 
-    client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
+    client = SimpleNamespace(models=SimpleNamespace(generate_content=generate_content))
     return client, calls
 
 
-def test_anthropic_provider_requests_structured_output():
-    client, calls = fake_anthropic_client()
-    provider = AnthropicProvider(model="test-model", client=client)
+def test_gemini_provider_requests_structured_output():
+    client, calls = fake_gemini_client()
+    provider = GeminiProvider(model="test-model", client=client)
 
     text = provider.complete("system", "prompt", {"type": "object"})
 
     assert text == '{"ok": 1}'
     request = calls[0]
     assert request["model"] == "test-model"
-    assert request["system"] == "system"
-    assert request["messages"] == [{"role": "user", "content": "prompt"}]
-    assert request["output_config"]["format"] == {"type": "json_schema", "schema": {"type": "object"}}
+    assert request["contents"] == "prompt"
+    config = request["config"]
+    assert config["system_instruction"] == "system"
+    assert config["response_mime_type"] == "application/json"
+    assert config["response_json_schema"] == {"type": "object"}
 
 
-def test_anthropic_provider_model_comes_from_environment(monkeypatch):
+def test_gemini_provider_model_comes_from_environment(monkeypatch):
     monkeypatch.setenv("CAMAGENT_MODEL", "env-model")
 
-    assert AnthropicProvider(client=object()).model == "env-model"
+    assert GeminiProvider(client=object()).model == "env-model"
 
 
 @pytest.mark.parametrize(
-    ("stop_reason", "content"),
+    ("finish_reason", "parts", "prompt_feedback"),
     [
-        ("refusal", None),
-        ("max_tokens", None),
-        ("end_turn", []),
-        ("end_turn", [SimpleNamespace(type="thinking", thinking="")]),
+        ("SAFETY", None, None),
+        ("MAX_TOKENS", None, None),
+        ("STOP", [], None),
+        ("STOP", [SimpleNamespace(text="only a thought", thought=True)], None),
+        ("STOP", None, SimpleNamespace(block_reason=SimpleNamespace(name="PROHIBITED_CONTENT"))),
     ],
 )
-def test_anthropic_provider_rejects_unusable_responses(stop_reason, content):
-    client, _ = fake_anthropic_client(stop_reason, content)
+def test_gemini_provider_rejects_unusable_responses(finish_reason, parts, prompt_feedback):
+    client, _ = fake_gemini_client(finish_reason, parts, prompt_feedback)
 
     with pytest.raises(LLMProviderError):
-        AnthropicProvider(client=client).complete("system", "prompt")
+        GeminiProvider(client=client).complete("system", "prompt")
 
 
-def test_anthropic_provider_wraps_request_failures():
-    def create(**kwargs):
+def test_gemini_provider_wraps_request_failures():
+    def generate_content(**kwargs):
         raise ConnectionError("network down")
 
-    client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
+    client = SimpleNamespace(models=SimpleNamespace(generate_content=generate_content))
 
     with pytest.raises(LLMProviderError, match="network down"):
-        AnthropicProvider(client=client).complete("system", "prompt")
+        GeminiProvider(client=client).complete("system", "prompt")

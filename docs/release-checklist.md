@@ -5,14 +5,14 @@ step gives the exact command and the result you should observe. Steps are
 labelled:
 
 - **Mocked**: the Linux utilities or the LLM are replaced by a stand-in inside
-  the snippet. Runs on any host. Nothing touches the kernel or the Anthropic API.
+  the snippet. Runs on any host. Nothing touches the kernel or the Gemini API.
 - **Real Linux**: runs the real `lsmod` and `modinfo` on a Linux host. Still
   read-only. No step in this checklist loads, unloads, or reloads a module.
 - **Review**: a manual check with no command output to compare.
 
 Completing this checklist is evidence for a release only when every expected
 result below was actually observed. Record what was run, on which host, in
-[Status](#status-as-of-2026-10-18) and keep that section honest.
+[Status](#status-as-of-2026-10-30) and keep that section honest.
 
 All commands run from the repository root with the virtual environment active.
 Multi-line Python snippets use `python - <<'EOF'`, which is bash syntax; on
@@ -91,7 +91,7 @@ so no API key is needed and no network call is made.
   from app.mcp_server import ToolDispatcher
 
   class FakeLLM:
-      """Stands in for the Anthropic provider: returns a fixed classification."""
+      """Stands in for the Gemini provider: returns a fixed classification."""
       def complete(self, system, prompt, response_schema=None):
           return json.dumps({
               "status": "action",
@@ -109,10 +109,11 @@ so no API key is needed and no network call is made.
   "module": "uvcvideo"}`, and `"result": {"executed": false}`. No utility is
   run; the parsed action is only returned.
 
-- [ ] Optional, with real credentials: set `ANTHROPIC_API_KEY`, start the MCP
-  server as in section 4, and call `parse_request` from a client. Expected:
-  the same envelope shape with `"result": {"executed": false}`. Not required
-  for the release and not covered by the automated tests.
+- [ ] Optional, with a real key: set `GEMINI_API_KEY`, start the MCP server
+  as in section 4, and call `parse_request` from a client (for example MCP
+  Inspector, see [mcp.md](mcp.md#mcp-inspector)). Expected: the same envelope
+  shape with `"result": {"executed": false}`. Not required for the release
+  and not covered by the automated tests.
 
 ## 4. MCP server start and tool discovery
 
@@ -299,8 +300,9 @@ that none of these paths executes a change.
 
 ## 7. Test suite
 
-**Mocked.** All tests replace Linux commands and the LLM; none loads or
-unloads a module or contacts the Anthropic API.
+**Mocked.** All tests replace Linux commands and the Gemini client; none loads
+or unloads a module or contacts the Gemini API, and no `GEMINI_API_KEY` is
+needed.
 
 - [ ] Full suite:
 
@@ -309,9 +311,9 @@ unloads a module or contacts the Anthropic API.
   ```
 
   Expected for a release: every test passes and no file fails to collect.
-  See [Status](#status-as-of-2026-10-18) for the current result.
+  See [Status](#status-as-of-2026-10-30) for the current result.
 
-- [ ] Focused groups. Counts are as of 2026-10-18 and grow as tests are added;
+- [ ] Focused groups. Counts are as of 2026-10-30 and grow as tests are added;
   the requirement is `0 failed`.
 
   | Group | Command | Expected |
@@ -319,7 +321,7 @@ unloads a module or contacts the Anthropic API.
   | Safety: schema, validator, policy, confirmation, executor, shared CLI/MCP policy | `python -m pytest -q tests/test_actions.py tests/test_validator.py tests/test_policy.py tests/test_confirmation.py tests/test_executor.py tests/test_shared_safety.py` | `149 passed` |
   | Module manager and CLI adapter | `python -m pytest -q tests/test_module_manager.py tests/test_cli.py` | `56 passed` |
   | MCP: dispatcher, argument validation, protocol | `python -m pytest -q tests/test_mcp_tools.py tests/test_mcp_validation.py tests/test_mcp_server.py tests/test_mcp_protocol_edge_cases.py` | `545 passed` (protocol files are skipped if `mcp` is missing) |
-  | Intent parsing | `python -m pytest -q tests/test_intent.py tests/test_intent_edge_cases.py` | `310 passed` |
+  | Intent parsing and Gemini provider | `python -m pytest -q tests/test_intent.py tests/test_intent_edge_cases.py tests/test_gemini_provider.py` | `427 passed` |
   | End-to-end workflows | `python -m pytest -q tests/test_end_to_end_workflows.py` | `134 passed` |
 
 ## 8. Opt-in Linux integration checks
@@ -352,10 +354,13 @@ Skipped automatically on other hosts and without the switch.
   resolves, the command tables match `python -m app.cli` and `help`, and the
   tool and status tables in [mcp.md](mcp.md) match the output of sections 4
   and 5.
-- [ ] Dependencies: `requirements.txt` lists `pytest`, `anthropic`, and `mcp`;
-  `python -m pip check` reports no broken requirements; every third-party
-  import in `app/` is covered (`anyio`, `mcp`, `mcp_types` come with `mcp`;
-  `anthropic` is imported lazily and only by `parse_request`).
+- [ ] Dependencies: `requirements.txt` lists `pytest`, `google-genai`, and
+  `mcp`; `python -m pip check` reports no broken requirements; every
+  third-party import in `app/` is covered (`anyio`, `mcp`, `mcp_types` come
+  with `mcp`; `google.genai` is imported lazily and only by `parse_request`).
+- [ ] No leftover LLM-provider configuration: `git grep -i anthropic` prints
+  nothing, and `.env` files are ignored (`git check-ignore .env` prints
+  `.env`).
 - [ ] Known limitations in [README.md](../README.md#current-limitations) are
   still accurate: commands-only CLI, stdio-only MCP, explicit `confirm`
   argument instead of elicitation, dry run only over MCP, one device alias set,
@@ -364,36 +369,38 @@ Skipped automatically on other hosts and without the switch.
   verified on real hardware unless someone did that deliberately outside this
   checklist.
 
-## Status as of 2026-10-18
+## Status as of 2026-10-30
 
-Recorded from a Windows 11 host with Python 3.13.15 and the project virtual
-environment. Update this section whenever the checklist is rerun.
+Recorded from a Windows 11 host with Python 3.13.7 after migrating
+`parse_request` from the Claude API to the Google Gemini API (`google-genai`
+2.34.0, `mcp` 2.3.0). Update this section whenever the checklist is rerun.
 
 Run and observed as expected:
 
-- Section 1: `pip check` clean. Linux utilities not present on this host.
+- Section 1: `pip install -r requirements.txt` and `pip check` clean
+  (`No broken requirements found.`). Linux utilities not present on this host.
 - Section 3: mocked intent demo printed `parsed`, `check_module uvcvideo`,
   `executed: false`.
-- Section 4: stdio tool discovery listed four tools by default and seven with
-  `CAMAGENT_MCP_ALLOW_MUTATIONS=1`; `check_module` returned `error` with
-  `FileNotFoundError`, as expected without `lsmod`.
-- Section 5: CLI and MCP rejections matched the tables.
-- Section 6: dry run, `confirmation_required`, `rejected`, and `DECLINED` all
-  observed; no `modprobe` attempt.
+- Section 4: stdio tool discovery against the real server listed four tools
+  by default and seven with `CAMAGENT_MCP_ALLOW_MUTATIONS=1`. With no
+  `GEMINI_API_KEY` in the server's environment, `parse_request` returned
+  `provider_error` with `GEMINI_API_KEY is not set; ...` in `errors` and
+  `result: {"executed": false}`; invalid arguments and a module name with
+  `;` returned `invalid_arguments`.
 - Section 7, full suite: `python -m pytest -q` exited 0 with
-  `1194 passed, 3 skipped` (the 3 skips are the Linux integration checks).
-  Focused groups: 149, 56, 545, 310, and 134 passed, 0 failed. An earlier run
-  the same day had failed on a missing `import pytest` in
-  `tests/test_module_manager.py` and on four tests that still asserted the
-  pre-refactor orchestrator error codes; both were fixed before this result.
-- Section 1: `pip check` clean after `pip install -r requirements.txt`, which
-  added the previously missing `anthropic` package to the virtual environment.
+  `1311 passed, 3 skipped` (the 3 skips are the Linux integration checks).
+  Focused groups: 149, 56, 545, 427, and 134 passed, 0 failed.
+- Section 9: `git diff --check` printed nothing; no `anthropic` or
+  `ANTHROPIC_API_KEY` reference remains in code, configuration, or
+  documentation; `.env` is ignored and `.env.example` is tracked.
 
 Not run:
 
-- Section 2 (real Linux read-only CLI) and section 8 (Linux integration
-  checks) were not run; no Linux host was available. Section 8 printed
-  `3 skipped` here. Real `lsmod` and `modinfo` behaviour therefore remains
-  unverified for this release.
-- Section 3 with real Anthropic credentials was not run. All intent tests use
-  a fake provider.
+- Section 2 (real Linux read-only CLI), section 5, section 6, and section 8
+  (Linux integration checks) were not rerun for this status; no Linux host
+  was available and sections 5 and 6 are unaffected by the provider change
+  but should be rerun before a release. Section 8 prints `3 skipped` here.
+- Section 3 with a real `GEMINI_API_KEY` was not run: no key was available,
+  so the live request shape (`response_json_schema` with the envelope
+  schema against `gemini-3.8-flash`) is verified only against the SDK's
+  signature and mocked responses, not against the Gemini service.
