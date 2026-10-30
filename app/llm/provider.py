@@ -24,6 +24,25 @@ API_KEY_ENV_VAR = "GEMINI_API_KEY"
 # fallback so a key set under that name is not reported as "not set".
 FALLBACK_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 
+# Bounded exponential backoff for transient failures, applied by the SDK's
+# own retry support (``HttpOptions.retry_options``), not a custom loop. Google
+# documents 408, 429 and 5xx as the responses worth retrying; 4 attempts with
+# delays of about 1s, 2s and 4s (plus jitter, capped at 10s) keeps a bad
+# outage to roughly 20 seconds before a provider_error is returned.
+RETRY_ATTEMPTS = 4  # including the first request
+RETRY_INITIAL_DELAY_SECONDS = 1.0
+RETRY_MAX_DELAY_SECONDS = 10.0
+RETRY_EXP_BASE = 2.0
+RETRY_JITTER_SECONDS = 1.0  # uniform random extra delay in [0, jitter]
+RETRYABLE_HTTP_STATUS_CODES = (408, 429, *range(500, 600))
+
+# Per-attempt HTTP timeout. The SDK's default is *no* timeout, so a request
+# that Gemini accepts but never answers would block the calling thread (and
+# an MCP tool call) forever, and the retry sequence would never start. With
+# a timeout each attempt gives up, counts as transient and is retried, so the
+# whole call is bounded by ``max_request_duration_seconds()``.
+REQUEST_TIMEOUT_SECONDS = 20.0
+
 # Finish reasons that mean Gemini refused or filtered the reply. Anything
 # other than a normal stop is treated as a failure: the parser must reject
 # rather than guess from partial output.
@@ -67,6 +86,45 @@ def _api_key_from_env() -> str:
     return ""
 
 
+def retry_options() -> dict[str, Any]:
+    """SDK ``HttpRetryOptions`` for the Gemini client, as a plain dict."""
+    return {
+        "attempts": RETRY_ATTEMPTS,
+        "initial_delay": RETRY_INITIAL_DELAY_SECONDS,
+        "max_delay": RETRY_MAX_DELAY_SECONDS,
+        "exp_base": RETRY_EXP_BASE,
+        "jitter": RETRY_JITTER_SECONDS,
+        "http_status_codes": list(RETRYABLE_HTTP_STATUS_CODES),
+    }
+
+
+def http_options() -> dict[str, Any]:
+    """SDK ``HttpOptions`` for the Gemini client: timeout plus retry policy."""
+    return {
+        "timeout": int(REQUEST_TIMEOUT_SECONDS * 1000),  # the SDK takes milliseconds
+        "retry_options": retry_options(),
+    }
+
+
+def max_request_duration_seconds() -> float:
+    """Upper bound on one ``complete()`` call: every attempt times out and
+    every backoff wait is as long as the policy allows."""
+    waits = sum(
+        min(RETRY_INITIAL_DELAY_SECONDS * RETRY_EXP_BASE**i + RETRY_JITTER_SECONDS, RETRY_MAX_DELAY_SECONDS)
+        for i in range(RETRY_ATTEMPTS - 1)
+    )
+    return RETRY_ATTEMPTS * REQUEST_TIMEOUT_SECONDS + waits
+
+
+def _is_http_timeout(exc: BaseException) -> bool:
+    """True for the HTTP client's timeout exceptions (httpx), checked by name
+    so the SDK and its HTTP client need not be imported here."""
+    return any(
+        cls.__module__.split(".")[0] == "httpx" and cls.__name__.endswith(("Timeout", "TimeoutException"))
+        for cls in type(exc).__mro__
+    )
+
+
 def _redact(text: str, secret: str | None) -> str:
     """Make sure an API key never appears in an error message."""
     if secret and secret in text:
@@ -80,6 +138,11 @@ def _describe_failure(exc: BaseException) -> str:
     message = getattr(exc, "message", None)
     status = getattr(exc, "status", None)
     detail = message if isinstance(message, str) and message else str(exc) or type(exc).__name__
+    if _is_http_timeout(exc):
+        return (
+            f"Gemini API did not respond within {REQUEST_TIMEOUT_SECONDS:g}s per attempt "
+            f"({RETRY_ATTEMPTS} attempts made): {type(exc).__name__}: {detail}"
+        )
     if isinstance(code, int):
         # The Gemini API reports an invalid key as HTTP 400 ("API key not
         # valid"), a key without access as 403, and some proxies as 401.
@@ -142,6 +205,14 @@ class GeminiProvider:
     error messages. The model defaults to ``gemini-3.8-flash`` and can be
     overridden with the ``CAMAGENT_MODEL`` environment variable or the
     ``model`` argument. A pre-built ``client`` can be injected for tests.
+
+    Each HTTP attempt is limited to ``REQUEST_TIMEOUT_SECONDS``. Transient
+    failures (HTTP 408, 429 and 5xx, timeouts and connection errors) are
+    retried by the SDK with bounded exponential backoff (see
+    ``retry_options``), so one call never takes longer than
+    ``max_request_duration_seconds()``. Once the attempts are exhausted the
+    last error is reported as an ``LLMProviderError`` exactly as before; a
+    failure is never turned into a successful completion.
     """
 
     def __init__(
@@ -172,7 +243,7 @@ class GeminiProvider:
                     "in Google AI Studio"
                 )
             try:
-                self._client = genai.Client(api_key=api_key)
+                self._client = genai.Client(api_key=api_key, http_options=http_options())
             except Exception as exc:
                 raise LLMProviderError(
                     _redact(f"could not create the Gemini client: {exc}", api_key)

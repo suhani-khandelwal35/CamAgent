@@ -473,7 +473,8 @@ for validation details and limitations.
 | `VALIDATION REJECTED:` with a module-name error | The name contains characters CamAgent refuses | Use the module's plain name, for example `uvcvideo`, not a path or `.ko` file. |
 | MCP response `tool_disabled` | State-changing tools are hidden | Start the server with `CAMAGENT_MCP_ALLOW_MUTATIONS=1`. |
 | MCP response `provider_error` from `parse_request` | `GEMINI_API_KEY` is not set or invalid, the Gemini quota is exhausted, the network is down, or the `google-genai` package is missing | Read the `errors` field: it names the missing variable, the HTTP status, or the missing package. Set `GEMINI_API_KEY` in the server's environment (see [Gemini API key](#gemini-api-key)) and install `google-genai`. The other tools are unaffected. |
-| `provider_error` with `Gemini API is unavailable (HTTP 503)` | Gemini reported the model as temporarily overloaded | A transient condition on Google's side, not a CamAgent error. Retry later, or point `CAMAGENT_MODEL` at another current model. |
+| `provider_error` with `Gemini API is unavailable (HTTP 503)` | Gemini reported the model as temporarily overloaded, and it stayed overloaded through CamAgent's automatic retries (4 attempts with exponential backoff, about 1s, 2s and 4s apart) | A transient condition on Google's side, not a CamAgent error. Retry later, or point `CAMAGENT_MODEL` at another current model. |
+| `provider_error` with `Gemini API did not respond within 20s per attempt` | Gemini accepted the connection but sent no reply within 20 seconds, on all 4 attempts | Also Google's side, seen during overload. Each attempt is capped at 20 seconds and the whole call at 90 seconds, so `parse_request` always returns. Retry later, or point `CAMAGENT_MODEL` at another current model. |
 
 ## Current limitations
 

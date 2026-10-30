@@ -286,14 +286,17 @@ Expected result: the response envelope with `"status": "parsed"`,
 `check_module` with `{"module": "uvcvideo"}`. A request Gemini cannot map
 returns `ambiguous` or `unsupported` with `"action": null`.
 
+A `parse_request` call normally returns in a few seconds. While Gemini is overloaded it can take up to 90 seconds (4 attempts of at most 20 seconds each, plus backoff waits) before the tool result arrives; the Inspector's default Request Timeout is 5 minutes (Configuration, `MCP_SERVER_REQUEST_TIMEOUT`), so the spinner ends with a result rather than a client-side timeout.
+
 `provider_error` entries you may see in `errors`:
 
 | `errors` entry | Meaning |
 | --- | --- |
 | `GEMINI_API_KEY is not set ...` | The server process has no key: the variable was not in the window that launched the Inspector, the Inspector is 2.x, or the panel holds an empty `GEMINI_API_KEY` row. |
 | `Gemini API authentication failed (HTTP 400 or 403) ...` | A key reached Gemini and was rejected: a typo, the literal `%GEMINI_API_KEY%`, or a revoked key. The key value is never included. |
-| `Gemini API is unavailable (HTTP 503) ...` | Gemini's side: the model is temporarily overloaded. Not an application error. Retry, or set `CAMAGENT_MODEL` to another current model. |
+| `Gemini API is unavailable (HTTP 503) ...` | Gemini's side: the model is temporarily overloaded, and the SDK's automatic retries (4 attempts, exponential backoff with jitter, delays capped at 10s) did not get through. Not an application error. Retry, or set `CAMAGENT_MODEL` to another current model. |
 | `Gemini API rate limit or quota exceeded (HTTP 429) ...` | The key's quota is exhausted for now. Wait, or use another model. |
+| `Gemini API did not respond within 20s per attempt (4 attempts made) ...` | Gemini accepted each request but never answered. Every attempt is capped at 20 seconds and retried, so the call ends within 90 seconds. Google's side; retry later or use another model. |
 
 The same check from the command line, without the browser, uses the
 Inspector's CLI mode (flags before the command, no `--`):

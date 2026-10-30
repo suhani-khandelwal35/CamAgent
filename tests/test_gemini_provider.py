@@ -8,7 +8,9 @@ exceptions, and every attempt to run a system command fails the test.
 Covered: successful parsing for all six actions, ambiguous and unsupported
 requests, missing and hallucinated module names, invalid JSON, malformed and
 empty Gemini responses, authentication, rate-limit and connection failures,
-and the deterministic safety validation that runs after parsing.
+the deterministic safety validation that runs after parsing, and the SDK's
+bounded retry of transient HTTP failures (exercised with the real SDK over an
+in-process mock transport, with sleeping replaced by a recorder).
 """
 
 from __future__ import annotations
@@ -18,14 +20,31 @@ import subprocess
 from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import pytest
+from mcp import types as mcp_types
 
 from app.agent import ActionExecutor
 from app.llm import GeminiProvider, IntentParser, LLMProviderError
 from app.llm.intent import RESPONSE_SCHEMA, SYSTEM_PROMPT
-from app.llm.provider import API_KEY_ENV_VAR, DEFAULT_MODEL, FALLBACK_API_KEY_ENV_VAR, MODEL_ENV_VAR
+from app.llm.provider import (
+    API_KEY_ENV_VAR,
+    DEFAULT_MODEL,
+    FALLBACK_API_KEY_ENV_VAR,
+    MODEL_ENV_VAR,
+    RETRY_ATTEMPTS,
+    RETRY_EXP_BASE,
+    RETRY_INITIAL_DELAY_SECONDS,
+    RETRY_JITTER_SECONDS,
+    RETRY_MAX_DELAY_SECONDS,
+    REQUEST_TIMEOUT_SECONDS,
+    http_options,
+    max_request_duration_seconds,
+    retry_options,
+)
 from app.manager import module_manager
 from app.mcp_server import TOOL_SPECS, ToolDispatcher
+from app.mcp_server.server import create_server
 from app.safety import DEFAULT_PROTECTED_MODULES, SafetyPolicy, validate_raw
 from app.schemas import ALLOWED_OPERATIONS
 
@@ -594,7 +613,7 @@ def test_api_key_is_read_from_env_and_never_echoed(monkeypatch):
     created: dict[str, Any] = {}
 
     class FakeSDKClient(FakeGeminiClient):
-        def __init__(self, *, api_key: str) -> None:
+        def __init__(self, *, api_key: str, http_options: Any = None) -> None:
             created["api_key"] = api_key
             super().__init__(error=RuntimeError(f"request to https://x/?key={secret} failed"))
 
@@ -628,7 +647,7 @@ def test_key_lookup_prefers_gemini_then_google_variable(monkeypatch, gemini_valu
     created: dict[str, Any] = {}
 
     class FakeSDKClient(FakeGeminiClient):
-        def __init__(self, *, api_key: str) -> None:
+        def __init__(self, *, api_key: str, http_options: Any = None) -> None:
             created["api_key"] = api_key
             super().__init__([reply("list_modules")])
 
@@ -661,7 +680,7 @@ def test_client_is_created_once_and_reused(monkeypatch):
     instances: list[FakeGeminiClient] = []
 
     class FakeSDKClient(FakeGeminiClient):
-        def __init__(self, *, api_key: str) -> None:
+        def __init__(self, *, api_key: str, http_options: Any = None) -> None:
             super().__init__([reply("list_modules"), reply("list_modules")])
             instances.append(self)
 
@@ -688,6 +707,311 @@ def test_missing_sdk_is_reported(monkeypatch):
 
     with pytest.raises(LLMProviderError, match="google-genai"):
         GeminiProvider().complete("sys", "hello")
+
+
+# --------------------------------------------------------------------------- #
+# Bounded retry of transient failures (real SDK, in-process mock transport)
+# --------------------------------------------------------------------------- #
+
+
+def _ok_body(operation: str = "list_modules", module: str | None = None) -> dict:
+    text = json.dumps(envelope(operation, module))
+    return {"candidates": [{"content": {"parts": [{"text": text}], "role": "model"}, "finishReason": "STOP"}]}
+
+
+def _error_body(code: int, message: str, status: str) -> dict:
+    return {"error": {"code": code, "message": message, "status": status}}
+
+
+class RecordingTransport:
+    """Scripted HTTP responses for the SDK's httpx client; no sockets involved.
+
+    ``script`` is a list of ``(status_code, json_body)``; the last entry is
+    repeated once the script runs out. Every request is recorded.
+    """
+
+    def __init__(self, script: list[tuple[int, dict]]) -> None:
+        self.script = list(script)
+        self.requests: list[Any] = []
+
+    def handler(self, request):
+        import httpx
+
+        self.requests.append(request)
+        status, body = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        return httpx.Response(status, json=body, request=request)
+
+
+@pytest.fixture
+def sdk_transport(monkeypatch):
+    """Route the provider's real SDK client through a scripted transport.
+
+    The provider still builds the client itself (key lookup, retry options),
+    so the whole ``_get_client`` path is exercised; only the HTTP layer and
+    ``time.sleep`` are replaced. Yields ``(install, sleeps, created)``:
+    ``install(script)`` returns the RecordingTransport, ``sleeps`` lists the
+    backoff delays the SDK asked for, ``created`` records the http_options
+    the provider passed to the SDK client.
+    """
+    genai = pytest.importorskip("google.genai")
+    httpx = pytest.importorskip("httpx")
+    import time
+
+    real_client = genai.Client
+    sleeps: list[float] = []
+    created: dict[str, Any] = {}
+
+    def install(script: list[tuple[int, dict]]) -> RecordingTransport:
+        transport = RecordingTransport(script)
+
+        def patched_client(*, api_key: str, http_options: dict | None = None, **kwargs: Any):
+            created["http_options"] = dict(http_options or {})
+            options = dict(http_options or {})
+            options["client_args"] = {"transport": httpx.MockTransport(transport.handler)}
+            return real_client(api_key=api_key, http_options=options, **kwargs)
+
+        monkeypatch.setattr(genai, "Client", patched_client)
+        return transport
+
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    return install, sleeps, created
+
+
+def _assert_backoff_is_bounded(sleeps: list[float]) -> None:
+    for index, delay in enumerate(sleeps):
+        base = RETRY_INITIAL_DELAY_SECONDS * RETRY_EXP_BASE**index
+        assert 0 < delay <= RETRY_MAX_DELAY_SECONDS
+        assert min(base, RETRY_MAX_DELAY_SECONDS) <= delay
+        assert delay <= min(base + RETRY_JITTER_SECONDS, RETRY_MAX_DELAY_SECONDS)
+
+
+def test_retry_options_match_the_documented_policy(sdk_transport, monkeypatch):
+    install, _, created = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    install([(200, _ok_body())])
+
+    assert IntentParser(GeminiProvider()).parse("list modules").ok
+
+    assert created["http_options"] == http_options()
+    options = created["http_options"]["retry_options"]
+    assert options == retry_options()
+    assert options["attempts"] == RETRY_ATTEMPTS == 4
+    assert options["initial_delay"] == 1.0
+    assert options["max_delay"] == 10.0
+    assert options["exp_base"] == 2.0
+    assert options["jitter"] > 0
+    assert {408, 429, 500, 502, 503, 504, 599} <= set(options["http_status_codes"])
+    assert not {400, 401, 403, 404} & set(options["http_status_codes"])
+
+
+def test_one_503_then_success_is_parsed(sdk_transport, monkeypatch):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    overloaded = (503, _error_body(503, "The model is overloaded.", "UNAVAILABLE"))
+    transport = install([overloaded, (200, _ok_body())])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert result.ok and result.action.operation == "list_modules"
+    assert len(transport.requests) == 2
+    assert len(sleeps) == 1
+    _assert_backoff_is_bounded(sleeps)
+
+
+def test_two_503s_then_success_is_parsed(sdk_transport, monkeypatch):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    overloaded = (503, _error_body(503, "The model is overloaded.", "UNAVAILABLE"))
+    transport = install([overloaded, overloaded, (200, _ok_body("check_module", "uvcvideo"))])
+
+    result = IntentParser(GeminiProvider()).parse("is uvcvideo loaded?")
+
+    assert result.ok and result.action.operation == "check_module" and result.action.module == "uvcvideo"
+    assert len(transport.requests) == 3
+    assert len(sleeps) == 2
+    _assert_backoff_is_bounded(sleeps)
+    assert sleeps[1] > sleeps[0]
+
+
+def test_persistent_503_stops_after_four_attempts_with_a_provider_error(sdk_transport, monkeypatch):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(503, _error_body(503, "The model is overloaded.", "UNAVAILABLE"))])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert "Gemini API is unavailable (HTTP 503)" in result.errors[0]
+    assert "overloaded" in result.errors[0]
+    assert len(transport.requests) == RETRY_ATTEMPTS == 4
+    assert len(sleeps) == RETRY_ATTEMPTS - 1
+    _assert_backoff_is_bounded(sleeps)
+    assert sum(sleeps) <= (RETRY_ATTEMPTS - 1) * RETRY_MAX_DELAY_SECONDS
+
+
+def test_429_is_retried_then_reported_if_it_persists(sdk_transport, monkeypatch):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    limited = (429, _error_body(429, "Resource has been exhausted", "RESOURCE_EXHAUSTED"))
+
+    transport = install([limited, (200, _ok_body())])
+    assert IntentParser(GeminiProvider()).parse("list modules").ok
+    assert len(transport.requests) == 2 and len(sleeps) == 1
+
+    sleeps.clear()
+    transport = install([limited])
+    result = IntentParser(GeminiProvider()).parse("list modules")
+    assert_rejected(result, "provider_error")
+    assert "rate limit or quota exceeded (HTTP 429)" in result.errors[0]
+    assert len(transport.requests) == RETRY_ATTEMPTS
+    _assert_backoff_is_bounded(sleeps)
+
+
+@pytest.mark.parametrize(
+    "code, status", [(400, "INVALID_ARGUMENT"), (403, "PERMISSION_DENIED"), (404, "NOT_FOUND")]
+)
+def test_non_transient_client_errors_are_not_retried(sdk_transport, monkeypatch, code, status):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(code, _error_body(code, "bad request", status)), (200, _ok_body())])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert f"(HTTP {code})" in result.errors[0]
+    assert len(transport.requests) == 1
+    assert sleeps == []
+
+
+def test_invalid_key_400_is_not_retried_and_names_the_variable(sdk_transport, monkeypatch):
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "not-a-real-key")
+    body = _error_body(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT")
+    transport = install([(400, body)])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert result.errors[0].startswith("Gemini API authentication failed (HTTP 400)")
+    assert API_KEY_ENV_VAR in result.errors[0]
+    assert len(transport.requests) == 1 and sleeps == []
+
+
+def test_missing_key_is_unchanged_by_retry_support(sdk_transport):
+    install, sleeps, created = sdk_transport
+    transport = install([(200, _ok_body())])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert result.errors[0].startswith(f"{API_KEY_ENV_VAR} is not set")
+    assert transport.requests == [] and sleeps == [] and created == {}
+
+
+def test_key_is_sent_as_a_header_and_never_appears_in_retry_errors(sdk_transport, monkeypatch):
+    install, _, _ = sdk_transport
+    secret = "AIza-retry-test-secret"
+    monkeypatch.setenv(API_KEY_ENV_VAR, secret)
+    # A hostile or buggy upstream that echoes the key in its error body.
+    transport = install([(503, _error_body(503, f"overloaded; key={secret}", "UNAVAILABLE"))])
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert len(transport.requests) == RETRY_ATTEMPTS
+    assert all(r.headers.get("x-goog-api-key") == secret for r in transport.requests)
+    assert all(secret not in str(r.url) for r in transport.requests)
+    assert secret not in json.dumps(result.to_dict())
+    assert "***" in result.errors[0]
+
+
+def test_every_attempt_has_an_http_timeout(sdk_transport, monkeypatch):
+    install, _, created = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(200, _ok_body())])
+
+    assert IntentParser(GeminiProvider()).parse("list modules").ok
+
+    assert created["http_options"]["timeout"] == int(REQUEST_TIMEOUT_SECONDS * 1000) == 20000
+    # The SDK also tells Gemini's server how long the client will wait.
+    assert transport.requests[0].headers.get("x-server-timeout") == "20"
+
+
+def test_unresponsive_upstream_times_out_is_retried_and_then_reported(sdk_transport, monkeypatch):
+    """A request Gemini accepts but never answers must not block forever."""
+    httpx = pytest.importorskip("httpx")
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(200, _ok_body())])
+    attempts: list[Any] = []
+
+    def never_answers(request):
+        attempts.append(request)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    transport.handler = never_answers
+
+    result = IntentParser(GeminiProvider()).parse("list modules")
+
+    assert_rejected(result, "provider_error")
+    assert result.errors[0].startswith("Gemini API did not respond within 20s per attempt (4 attempts made)")
+    assert "ReadTimeout" in result.errors[0]
+    assert len(attempts) == RETRY_ATTEMPTS
+    assert len(sleeps) == RETRY_ATTEMPTS - 1
+    _assert_backoff_is_bounded(sleeps)
+
+
+def test_timeout_then_success_is_parsed(sdk_transport, monkeypatch):
+    httpx = pytest.importorskip("httpx")
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(200, _ok_body())])
+    scripted = transport.handler
+    seen: list[Any] = []
+
+    def slow_once(request):
+        seen.append(request)
+        if len(seen) == 1:
+            raise httpx.ReadTimeout("timed out", request=request)
+        return scripted(request)
+
+    transport.handler = slow_once
+
+    assert IntentParser(GeminiProvider()).parse("list modules").ok
+    assert len(seen) == 2 and len(sleeps) == 1
+
+
+def test_whole_call_is_bounded_well_under_the_inspector_request_timeout():
+    # MCP Inspector 1.0.3 cancels a tool call after 5 minutes by default.
+    bound = max_request_duration_seconds()
+    assert bound == 4 * 20.0 + (2.0 + 3.0 + 5.0) == 90.0
+    assert bound < 300
+
+
+def test_non_httpx_timeout_keeps_the_generic_mapping():
+    result, _ = parse("list modules", error=TimeoutError("timed out"))
+
+    assert_rejected(result, "provider_error")
+    assert result.errors[0].startswith("LLM request failed: TimeoutError")
+
+
+def test_retries_never_turn_a_failure_into_a_parsed_action(sdk_transport, monkeypatch):
+    install, _, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    install(
+        [
+            (503, _error_body(503, "overloaded", "UNAVAILABLE")),
+            (500, _error_body(500, "internal", "INTERNAL")),
+            (502, _error_body(502, "bad gateway", "UNAVAILABLE")),
+            (504, _error_body(504, "timeout", "DEADLINE_EXCEEDED")),
+        ]
+    )
+
+    result = IntentParser(GeminiProvider()).parse("load uvcvideo")
+
+    assert_rejected(result, "provider_error")
+    assert result.action is None and not result.ok
+    assert "(HTTP 504)" in result.errors[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -824,6 +1148,48 @@ def test_mcp_parse_request_reports_provider_failures(manager, executor):
     assert response["action"] is None
     assert response["result"] == {"executed": False}
     assert "429" in response["errors"][0]
+
+
+def test_mcp_call_tool_returns_a_result_after_the_retry_sequence(sdk_transport, monkeypatch, manager):
+    """Through the real MCP handler: the blocking provider call runs on a
+    worker thread and the handler returns a tool result once the SDK has
+    given up, instead of hanging."""
+    httpx = pytest.importorskip("httpx")
+    install, sleeps, _ = sdk_transport
+    monkeypatch.setenv(API_KEY_ENV_VAR, "k")
+    transport = install([(503, _error_body(503, "The model is overloaded.", "UNAVAILABLE"))])
+    attempts: list[Any] = []
+    scripted = transport.handler
+
+    def overloaded_then_silent(request):
+        attempts.append(request)
+        if len(attempts) % 2:
+            return scripted(request)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    transport.handler = overloaded_then_silent
+    executor = ActionExecutor(manager=manager, policy=SafetyPolicy(is_module_loaded=manager.is_module_loaded))
+    server = create_server(ToolDispatcher(executor))  # default parser: GeminiProvider via the real SDK
+    handler = server.get_request_handler("tools/call").handler
+
+    async def call():
+        request = mcp_types.CallToolRequest(
+            method="tools/call",
+            params=mcp_types.CallToolRequestParams(name="parse_request", arguments={"request": "list modules"}),
+        )
+        with anyio.fail_after(10):
+            return await handler(None, request.params)
+
+    result = anyio.run(call)
+
+    assert isinstance(result, mcp_types.CallToolResult)
+    payload = result.structured_content
+    assert payload == json.loads(result.content[0].text)
+    assert payload["status"] == "provider_error" and payload["action"] is None
+    assert payload["result"] == {"executed": False}
+    assert "did not respond within 20s" in payload["errors"][0]
+    assert len(attempts) == RETRY_ATTEMPTS
+    assert len(sleeps) == RETRY_ATTEMPTS - 1
 
 
 def test_mcp_default_parser_uses_gemini_and_starts_without_a_key(monkeypatch, executor):
